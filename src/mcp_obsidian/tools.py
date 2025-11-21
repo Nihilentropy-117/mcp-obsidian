@@ -7,6 +7,7 @@ from mcp.types import (
 )
 import json
 import os
+from rapidfuzz import fuzz, process
 from . import obsidian
 
 api_key = os.getenv("OBSIDIAN_API_KEY", "")
@@ -623,6 +624,145 @@ class RecentChangesToolHandler(ToolHandler):
 
         api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
         results = api.get_recent_changes(limit, days)
+
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps(results, indent=2)
+            )
+        ]
+
+class FuzzySearchToolHandler(ToolHandler):
+    def __init__(self):
+        super().__init__("obsidian_fuzzy_search")
+
+    def get_tool_description(self):
+        return Tool(
+            name=self.name,
+            description="""Fuzzy search for files in the vault by filename using fuzzy string matching.
+            This is useful when you're not sure of the exact filename or want to find files with similar names.
+            The search is case-insensitive and tolerant of typos and partial matches.
+
+            Use this tool when you want to find files even if you don't know the exact name, or when dealing with typos.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Text to fuzzy search for in filenames"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default: 10)",
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": 50
+                    },
+                    "score_threshold": {
+                        "type": "number",
+                        "description": "Minimum similarity score (0-100) to include in results (default: 60)",
+                        "default": 60,
+                        "minimum": 0,
+                        "maximum": 100
+                    },
+                    "search_content": {
+                        "type": "boolean",
+                        "description": "Whether to also fuzzy search file contents (default: false). Warning: searching content is slower.",
+                        "default": False
+                    }
+                },
+                "required": ["query"]
+            }
+        )
+
+    def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        if "query" not in args:
+            raise RuntimeError("query argument missing in arguments")
+
+        query = args["query"]
+        limit = args.get("limit", 10)
+        score_threshold = args.get("score_threshold", 60)
+        search_content = args.get("search_content", False)
+
+        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
+
+        # Get all files in the vault
+        all_files = api.list_files_in_vault()
+
+        # Extract file paths
+        file_paths = []
+
+        def extract_paths(items, prefix=""):
+            for item in items:
+                if isinstance(item, dict):
+                    # It's a directory
+                    for key, value in item.items():
+                        new_prefix = f"{prefix}{key}/" if prefix else f"{key}/"
+                        extract_paths(value, new_prefix)
+                elif isinstance(item, str):
+                    # It's a file
+                    file_paths.append(f"{prefix}{item}")
+
+        extract_paths(all_files)
+
+        # Perform fuzzy matching on filenames
+        results = []
+
+        if search_content:
+            # Search both filename and content (slower)
+            for file_path in file_paths:
+                # Score based on filename
+                filename_score = fuzz.WRatio(query.lower(), file_path.lower())
+
+                # If filename score is high enough, include it
+                if filename_score >= score_threshold:
+                    results.append({
+                        'filepath': file_path,
+                        'score': filename_score,
+                        'match_type': 'filename'
+                    })
+                else:
+                    # Try content search for files that didn't match by name
+                    try:
+                        content_data = api.get_file_contents(file_path)
+                        content = content_data.get('content', '') if isinstance(content_data, dict) else ''
+
+                        if content:
+                            # Use partial ratio for content matching
+                            content_score = fuzz.partial_ratio(query.lower(), content.lower())
+
+                            if content_score >= score_threshold:
+                                results.append({
+                                    'filepath': file_path,
+                                    'score': content_score,
+                                    'match_type': 'content'
+                                })
+                    except Exception:
+                        # Skip files that can't be read
+                        pass
+        else:
+            # Search filenames only (faster)
+            # Use process.extract for efficient batch processing
+            matches = process.extract(
+                query,
+                file_paths,
+                scorer=fuzz.WRatio,
+                limit=limit * 2,  # Get more matches than needed to filter by threshold
+                score_cutoff=score_threshold
+            )
+
+            results = [
+                {
+                    'filepath': match[0],
+                    'score': match[1],
+                    'match_type': 'filename'
+                }
+                for match in matches
+            ]
+
+        # Sort by score descending and limit results
+        results.sort(key=lambda x: x['score'], reverse=True)
+        results = results[:limit]
 
         return [
             TextContent(
