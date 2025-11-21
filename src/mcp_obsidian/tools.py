@@ -7,6 +7,8 @@ from mcp.types import (
 )
 import json
 import os
+import yaml
+import re
 from rapidfuzz import fuzz, process
 from . import obsidian
 
@@ -768,5 +770,300 @@ class FuzzySearchToolHandler(ToolHandler):
             TextContent(
                 type="text",
                 text=json.dumps(results, indent=2)
+            )
+        ]
+
+class ListBasesToolHandler(ToolHandler):
+    def __init__(self):
+        super().__init__("obsidian_list_bases")
+
+    def get_tool_description(self):
+        return Tool(
+            name=self.name,
+            description="""List all Obsidian Bases (.base files) in the vault with their structure.
+            Returns information about each base including its filters, views, and available properties/columns.
+            This is useful for discovering what bases exist and what properties can be searched.""",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        )
+
+    def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
+
+        # Get all files in the vault
+        all_files = api.list_files_in_vault()
+
+        # Extract file paths and find .base files
+        base_files = []
+
+        def extract_paths(items, prefix=""):
+            for item in items:
+                if isinstance(item, dict):
+                    # It's a directory
+                    for key, value in item.items():
+                        new_prefix = f"{prefix}{key}/" if prefix else f"{key}/"
+                        extract_paths(value, new_prefix)
+                elif isinstance(item, str):
+                    # It's a file - check if it's a .base file
+                    if item.endswith('.base'):
+                        base_files.append(f"{prefix}{item}")
+
+        extract_paths(all_files)
+
+        # Parse each base file
+        bases_info = []
+        for base_path in base_files:
+            try:
+                # Get the content of the base file
+                content_data = api.get_file_contents(base_path)
+                content = content_data.get('content', '') if isinstance(content_data, dict) else ''
+
+                if content:
+                    # Parse YAML
+                    base_config = yaml.safe_load(content)
+
+                    # Extract filter properties
+                    filter_properties = set()
+                    if 'filters' in base_config:
+                        filter_str = str(base_config['filters'])
+                        # Extract property names from filter expressions
+                        # Look for patterns like "file.folder", "tags", "type", "status", etc.
+                        property_matches = re.findall(r'[\w\.]+(?=\s*[=<>!])', filter_str)
+                        filter_properties.update(property_matches)
+
+                    # Extract view columns
+                    all_columns = set()
+                    views_info = []
+                    if 'views' in base_config and isinstance(base_config['views'], list):
+                        for view in base_config['views']:
+                            view_name = view.get('name', 'Unnamed')
+                            view_type = view.get('type', 'table')
+                            columns = view.get('order', [])
+                            all_columns.update(columns)
+                            views_info.append({
+                                'name': view_name,
+                                'type': view_type,
+                                'columns': columns
+                            })
+
+                    bases_info.append({
+                        'filepath': base_path,
+                        'name': base_path.split('/')[-1].replace('.base', ''),
+                        'filters': base_config.get('filters', {}),
+                        'filter_properties': sorted(list(filter_properties)),
+                        'views': views_info,
+                        'all_columns': sorted(list(all_columns))
+                    })
+
+            except Exception as e:
+                # If we can't parse a base, include it with error info
+                bases_info.append({
+                    'filepath': base_path,
+                    'name': base_path.split('/')[-1].replace('.base', ''),
+                    'error': f"Failed to parse: {str(e)}"
+                })
+
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps(bases_info, indent=2)
+            )
+        ]
+
+class SearchBasesToolHandler(ToolHandler):
+    def __init__(self):
+        super().__init__("obsidian_search_bases")
+
+    def get_tool_description(self):
+        return Tool(
+            name=self.name,
+            description="""Search for notes within a specific Obsidian Base by filtering on properties.
+            First use obsidian_list_bases to discover available bases and their properties.
+
+            This tool finds notes that match the base's filter criteria and optionally applies
+            additional property filters. Results include note paths and their property values.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "base_name": {
+                        "type": "string",
+                        "description": "Name of the base to search (without .base extension)"
+                    },
+                    "property_filters": {
+                        "type": "object",
+                        "description": "Optional property filters as key-value pairs. Supports exact matches and partial text matching.",
+                        "additionalProperties": True
+                    },
+                    "include_content": {
+                        "type": "boolean",
+                        "description": "Whether to include full note content in results (default: false)",
+                        "default": False
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default: 50)",
+                        "default": 50,
+                        "minimum": 1,
+                        "maximum": 200
+                    }
+                },
+                "required": ["base_name"]
+            }
+        )
+
+    def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        if "base_name" not in args:
+            raise RuntimeError("base_name argument missing in arguments")
+
+        base_name = args["base_name"]
+        property_filters = args.get("property_filters", {})
+        include_content = args.get("include_content", False)
+        limit = args.get("limit", 50)
+
+        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
+
+        # Find the base file
+        all_files = api.list_files_in_vault()
+        base_path = None
+
+        def find_base(items, prefix=""):
+            nonlocal base_path
+            for item in items:
+                if isinstance(item, dict):
+                    for key, value in item.items():
+                        new_prefix = f"{prefix}{key}/" if prefix else f"{key}/"
+                        find_base(value, new_prefix)
+                elif isinstance(item, str):
+                    if item == f"{base_name}.base" or item.endswith(f"/{base_name}.base"):
+                        base_path = f"{prefix}{item}"
+                        return
+
+        find_base(all_files)
+
+        if not base_path:
+            raise RuntimeError(f"Base '{base_name}' not found in vault")
+
+        # Load and parse the base file
+        content_data = api.get_file_contents(base_path)
+        content = content_data.get('content', '') if isinstance(content_data, dict) else ''
+
+        if not content:
+            raise RuntimeError(f"Base file '{base_path}' is empty")
+
+        base_config = yaml.safe_load(content)
+
+        # Extract folder filter from base
+        target_folder = None
+        if 'filters' in base_config:
+            filters = base_config.get('filters', {})
+            # Look for file.folder filter
+            if isinstance(filters, dict):
+                and_conditions = filters.get('and', [])
+                for condition in and_conditions:
+                    if isinstance(condition, str) and 'file.folder' in condition:
+                        # Extract folder path from condition like "file.folder == 'Files/Places'"
+                        match = re.search(r'file\.folder\s*==\s*["\']([^"\']+)["\']', condition)
+                        if match:
+                            target_folder = match.group(1)
+
+        # Get files from the target folder
+        if target_folder:
+            try:
+                folder_files = api.list_files_in_dir(target_folder)
+            except Exception:
+                folder_files = []
+        else:
+            # If no folder filter, search entire vault
+            folder_files = all_files
+
+        # Extract markdown files
+        md_files = []
+
+        def extract_md_files(items, prefix=""):
+            for item in items:
+                if isinstance(item, dict):
+                    for key, value in item.items():
+                        new_prefix = f"{prefix}{key}/" if prefix else f"{key}/"
+                        extract_md_files(value, new_prefix)
+                elif isinstance(item, str):
+                    if item.endswith('.md'):
+                        full_path = f"{target_folder}/{prefix}{item}" if target_folder else f"{prefix}{item}"
+                        md_files.append(full_path)
+
+        extract_md_files(folder_files)
+
+        # Filter files based on properties
+        results = []
+        for file_path in md_files[:limit * 2]:  # Get more than needed for filtering
+            try:
+                # Get file content to extract properties
+                file_data = api.get_file_contents(file_path)
+                file_content = file_data.get('content', '') if isinstance(file_data, dict) else ''
+
+                # Parse frontmatter properties
+                properties = {}
+                if file_content.startswith('---'):
+                    # Extract YAML frontmatter
+                    parts = file_content.split('---', 2)
+                    if len(parts) >= 3:
+                        frontmatter = parts[1]
+                        try:
+                            properties = yaml.safe_load(frontmatter) or {}
+                        except Exception:
+                            properties = {}
+
+                # Apply property filters
+                matches = True
+                if property_filters:
+                    for prop_key, prop_value in property_filters.items():
+                        if prop_key not in properties:
+                            matches = False
+                            break
+
+                        actual_value = properties[prop_key]
+                        # Support exact match or partial text match
+                        if isinstance(prop_value, str) and isinstance(actual_value, str):
+                            if prop_value.lower() not in str(actual_value).lower():
+                                matches = False
+                                break
+                        elif actual_value != prop_value:
+                            matches = False
+                            break
+
+                if matches:
+                    result = {
+                        'filepath': file_path,
+                        'properties': properties
+                    }
+
+                    if include_content:
+                        # Remove frontmatter from content
+                        if file_content.startswith('---'):
+                            parts = file_content.split('---', 2)
+                            if len(parts) >= 3:
+                                result['content'] = parts[2].strip()
+                        else:
+                            result['content'] = file_content
+
+                    results.append(result)
+
+                    if len(results) >= limit:
+                        break
+
+            except Exception:
+                # Skip files that can't be read
+                continue
+
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps({
+                    'base': base_name,
+                    'total_results': len(results),
+                    'results': results
+                }, indent=2)
             )
         ]
