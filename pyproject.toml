@@ -24,4 +24,4 @@ dev = [
 ]
 
 [project.scripts]
-mcp-obsidian = "mcp_obsidian:main"
+mcp-obsidian = "mcp_obsidian:main_entry"

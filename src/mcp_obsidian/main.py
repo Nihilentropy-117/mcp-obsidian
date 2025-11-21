@@ -1,18 +1,39 @@
+"""
+MCP Obsidian Server - Direct Filesystem Access
+Consolidated single-file implementation
+"""
+
+import json
+import logging
+import os
+import re
+import shutil
+import yaml
 from collections.abc import Sequence
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+from mcp.server import Server
 from mcp.types import (
     Tool,
     TextContent,
     ImageContent,
     EmbeddedResource,
 )
-import json
-import os
-import yaml
-import re
-from pathlib import Path
 from rapidfuzz import fuzz, process
-from datetime import datetime, timedelta
-import shutil
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("mcp-obsidian")
+
+# =============================================================================
+# VAULT CONFIGURATION
+# =============================================================================
 
 vault_path = os.getenv("VAULT_PATH", "")
 
@@ -27,8 +48,13 @@ if not vault_root.exists():
 if not vault_root.is_dir():
     raise ValueError(f"VAULT_PATH is not a directory: {vault_path}")
 
+# Tool name constants
 TOOL_LIST_FILES_IN_VAULT = "obsidian_list_files_in_vault"
 TOOL_LIST_FILES_IN_DIR = "obsidian_list_files_in_dir"
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
 
 def get_vault_path(relative_path: str = "") -> Path:
     """Convert a relative vault path to absolute path and ensure it's within vault."""
@@ -77,6 +103,10 @@ def list_vault_files(dirpath: str = "") -> list:
         raise RuntimeError(f"Permission denied accessing: {dirpath}")
 
     return result
+
+# =============================================================================
+# TOOL HANDLERS
+# =============================================================================
 
 class ToolHandler():
     def __init__(self, tool_name: str):
@@ -1284,3 +1314,72 @@ class SearchBasesToolHandler(ToolHandler):
                 }, indent=2)
             )
         ]
+
+# =============================================================================
+# MCP SERVER SETUP
+# =============================================================================
+
+app = Server("mcp-obsidian")
+
+tool_handlers = {}
+
+def add_tool_handler(tool_class: ToolHandler):
+    global tool_handlers
+    tool_handlers[tool_class.name] = tool_class
+
+def get_tool_handler(name: str) -> ToolHandler | None:
+    if name not in tool_handlers:
+        return None
+    return tool_handlers[name]
+
+# Register all tool handlers
+add_tool_handler(ListFilesInDirToolHandler())
+add_tool_handler(ListFilesInVaultToolHandler())
+add_tool_handler(GetFileContentsToolHandler())
+add_tool_handler(SearchToolHandler())
+add_tool_handler(PatchContentToolHandler())
+add_tool_handler(AppendContentToolHandler())
+add_tool_handler(PutContentToolHandler())
+add_tool_handler(DeleteFileToolHandler())
+add_tool_handler(ComplexSearchToolHandler())
+add_tool_handler(BatchGetFileContentsToolHandler())
+add_tool_handler(PeriodicNotesToolHandler())
+add_tool_handler(RecentPeriodicNotesToolHandler())
+add_tool_handler(RecentChangesToolHandler())
+add_tool_handler(FuzzySearchToolHandler())
+add_tool_handler(ListBasesToolHandler())
+add_tool_handler(SearchBasesToolHandler())
+
+@app.list_tools()
+async def list_tools() -> list[Tool]:
+    """List available tools."""
+    return [th.get_tool_description() for th in tool_handlers.values()]
+
+@app.call_tool()
+async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+    """Handle tool calls for command line run."""
+
+    if not isinstance(arguments, dict):
+        raise RuntimeError("arguments must be dictionary")
+
+    tool_handler = get_tool_handler(name)
+    if not tool_handler:
+        raise ValueError(f"Unknown tool: {name}")
+
+    try:
+        return tool_handler.run_tool(arguments)
+    except Exception as e:
+        logger.error(str(e))
+        raise RuntimeError(f"Caught Exception. Error: {str(e)}")
+
+async def main():
+    """Main entry point for the MCP server."""
+    # Import here to avoid issues with event loops
+    from mcp.server.stdio import stdio_server
+
+    async with stdio_server() as (read_stream, write_stream):
+        await app.run(
+            read_stream,
+            write_stream,
+            app.create_initialization_options()
+        )
