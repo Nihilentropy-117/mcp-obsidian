@@ -9,17 +9,74 @@ import json
 import os
 import yaml
 import re
+from pathlib import Path
 from rapidfuzz import fuzz, process
-from . import obsidian
+from datetime import datetime, timedelta
+import shutil
 
-api_key = os.getenv("OBSIDIAN_API_KEY", "")
-obsidian_host = os.getenv("OBSIDIAN_HOST", "127.0.0.1")
+vault_path = os.getenv("VAULT_PATH", "")
 
-if api_key == "":
-    raise ValueError(f"OBSIDIAN_API_KEY environment variable required. Working directory: {os.getcwd()}")
+if vault_path == "":
+    raise ValueError(f"VAULT_PATH environment variable required. Working directory: {os.getcwd()}")
+
+vault_root = Path(vault_path).resolve()
+
+if not vault_root.exists():
+    raise ValueError(f"VAULT_PATH does not exist: {vault_path}")
+
+if not vault_root.is_dir():
+    raise ValueError(f"VAULT_PATH is not a directory: {vault_path}")
 
 TOOL_LIST_FILES_IN_VAULT = "obsidian_list_files_in_vault"
 TOOL_LIST_FILES_IN_DIR = "obsidian_list_files_in_dir"
+
+def get_vault_path(relative_path: str = "") -> Path:
+    """Convert a relative vault path to absolute path and ensure it's within vault."""
+    if relative_path:
+        full_path = (vault_root / relative_path).resolve()
+    else:
+        full_path = vault_root.resolve()
+
+    # Security check: ensure path is within vault
+    try:
+        full_path.relative_to(vault_root)
+    except ValueError:
+        raise RuntimeError(f"Path {relative_path} is outside vault")
+
+    return full_path
+
+def list_vault_files(dirpath: str = "") -> list:
+    """Recursively list files in a directory, returning nested dict/list structure."""
+    target_path = get_vault_path(dirpath)
+
+    if not target_path.exists():
+        raise RuntimeError(f"Directory does not exist: {dirpath}")
+
+    if not target_path.is_dir():
+        raise RuntimeError(f"Path is not a directory: {dirpath}")
+
+    result = []
+
+    try:
+        items = sorted(target_path.iterdir(), key=lambda x: (not x.is_dir(), x.name))
+
+        for item in items:
+            # Skip hidden files and directories
+            if item.name.startswith('.'):
+                continue
+
+            if item.is_dir():
+                # Recursively get directory contents
+                subdir_contents = list_vault_files(str(item.relative_to(vault_root)))
+                if subdir_contents:  # Only include non-empty directories
+                    result.append({item.name: subdir_contents})
+            else:
+                result.append(item.name)
+
+    except PermissionError:
+        raise RuntimeError(f"Permission denied accessing: {dirpath}")
+
+    return result
 
 class ToolHandler():
     def __init__(self, tool_name: str):
@@ -30,7 +87,7 @@ class ToolHandler():
 
     def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
         raise NotImplementedError()
-    
+
 class ListFilesInVaultToolHandler(ToolHandler):
     def __init__(self):
         super().__init__(TOOL_LIST_FILES_IN_VAULT)
@@ -47,9 +104,7 @@ class ListFilesInVaultToolHandler(ToolHandler):
         )
 
     def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
-        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-
-        files = api.list_files_in_vault()
+        files = list_vault_files()
 
         return [
             TextContent(
@@ -57,7 +112,7 @@ class ListFilesInVaultToolHandler(ToolHandler):
                 text=json.dumps(files, indent=2)
             )
         ]
-    
+
 class ListFilesInDirToolHandler(ToolHandler):
     def __init__(self):
         super().__init__(TOOL_LIST_FILES_IN_DIR)
@@ -79,13 +134,10 @@ class ListFilesInDirToolHandler(ToolHandler):
         )
 
     def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
-
         if "dirpath" not in args:
             raise RuntimeError("dirpath argument missing in arguments")
 
-        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-
-        files = api.list_files_in_dir(args["dirpath"])
+        files = list_vault_files(args["dirpath"])
 
         return [
             TextContent(
@@ -93,7 +145,7 @@ class ListFilesInDirToolHandler(ToolHandler):
                 text=json.dumps(files, indent=2)
             )
         ]
-    
+
 class GetFileContentsToolHandler(ToolHandler):
     def __init__(self):
         super().__init__("obsidian_get_file_contents")
@@ -119,17 +171,26 @@ class GetFileContentsToolHandler(ToolHandler):
         if "filepath" not in args:
             raise RuntimeError("filepath argument missing in arguments")
 
-        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
+        file_path = get_vault_path(args["filepath"])
 
-        content = api.get_file_contents(args["filepath"])
+        if not file_path.exists():
+            raise RuntimeError(f"File does not exist: {args['filepath']}")
+
+        if not file_path.is_file():
+            raise RuntimeError(f"Path is not a file: {args['filepath']}")
+
+        try:
+            content = file_path.read_text(encoding='utf-8')
+        except Exception as e:
+            raise RuntimeError(f"Error reading file: {str(e)}")
 
         return [
             TextContent(
                 type="text",
-                text=json.dumps(content, indent=2)
+                text=content
             )
         ]
-    
+
 class SearchToolHandler(ToolHandler):
     def __init__(self):
         super().__init__("obsidian_simple_search")
@@ -137,7 +198,7 @@ class SearchToolHandler(ToolHandler):
     def get_tool_description(self):
         return Tool(
             name=self.name,
-            description="""Simple search for documents matching a specified text query across all files in the vault. 
+            description="""Simple search for documents matching a specified text query across all files in the vault.
             Use this tool when you want to do a simple text search""",
             inputSchema={
                 "type": "object",
@@ -160,38 +221,64 @@ class SearchToolHandler(ToolHandler):
         if "query" not in args:
             raise RuntimeError("query argument missing in arguments")
 
+        query = args["query"]
         context_length = args.get("context_length", 100)
-        
-        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-        results = api.search(args["query"], context_length)
-        
-        formatted_results = []
-        for result in results:
-            formatted_matches = []
-            for match in result.get('matches', []):
-                context = match.get('context', '')
-                match_pos = match.get('match', {})
-                start = match_pos.get('start', 0)
-                end = match_pos.get('end', 0)
-                
-                formatted_matches.append({
-                    'context': context,
-                    'match_position': {'start': start, 'end': end}
-                })
-                
-            formatted_results.append({
-                'filename': result.get('filename', ''),
-                'score': result.get('score', 0),
-                'matches': formatted_matches
-            })
+
+        results = []
+
+        # Search all files in vault
+        for file_path in vault_root.rglob("*"):
+            if not file_path.is_file() or file_path.name.startswith('.'):
+                continue
+
+            try:
+                content = file_path.read_text(encoding='utf-8')
+                relative_path = str(file_path.relative_to(vault_root))
+
+                # Find all occurrences of query
+                matches = []
+                content_lower = content.lower()
+                query_lower = query.lower()
+
+                pos = 0
+                while True:
+                    pos = content_lower.find(query_lower, pos)
+                    if pos == -1:
+                        break
+
+                    # Extract context
+                    start = max(0, pos - context_length)
+                    end = min(len(content), pos + len(query) + context_length)
+                    context = content[start:end]
+
+                    matches.append({
+                        'context': context,
+                        'match_position': {
+                            'start': pos,
+                            'end': pos + len(query)
+                        }
+                    })
+
+                    pos += 1
+
+                if matches:
+                    results.append({
+                        'filename': relative_path,
+                        'score': len(matches),
+                        'matches': matches
+                    })
+
+            except (UnicodeDecodeError, PermissionError):
+                # Skip binary files or files we can't read
+                continue
 
         return [
             TextContent(
                 type="text",
-                text=json.dumps(formatted_results, indent=2)
+                text=json.dumps(results, indent=2)
             )
         ]
-    
+
 class AppendContentToolHandler(ToolHandler):
    def __init__(self):
        super().__init__("obsidian_append_content")
@@ -221,8 +308,16 @@ class AppendContentToolHandler(ToolHandler):
        if "filepath" not in args or "content" not in args:
            raise RuntimeError("filepath and content arguments required")
 
-       api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-       api.append_content(args.get("filepath", ""), args["content"])
+       file_path = get_vault_path(args["filepath"])
+
+       # Create parent directories if they don't exist
+       file_path.parent.mkdir(parents=True, exist_ok=True)
+
+       try:
+           with open(file_path, 'a', encoding='utf-8') as f:
+               f.write(args["content"])
+       except Exception as e:
+           raise RuntimeError(f"Error appending to file: {str(e)}")
 
        return [
            TextContent(
@@ -230,7 +325,7 @@ class AppendContentToolHandler(ToolHandler):
                text=f"Successfully appended content to {args['filepath']}"
            )
        ]
-   
+
 class PatchContentToolHandler(ToolHandler):
    def __init__(self):
        super().__init__("obsidian_patch_content")
@@ -258,7 +353,7 @@ class PatchContentToolHandler(ToolHandler):
                        "enum": ["heading", "block", "frontmatter"]
                    },
                    "target": {
-                       "type": "string", 
+                       "type": "string",
                        "description": "Target identifier (heading path, block reference, or frontmatter field)"
                    },
                    "content": {
@@ -274,14 +369,62 @@ class PatchContentToolHandler(ToolHandler):
        if not all(k in args for k in ["filepath", "operation", "target_type", "target", "content"]):
            raise RuntimeError("filepath, operation, target_type, target and content arguments required")
 
-       api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-       api.patch_content(
-           args.get("filepath", ""),
-           args.get("operation", ""),
-           args.get("target_type", ""),
-           args.get("target", ""),
-           args.get("content", "")
-       )
+       file_path = get_vault_path(args["filepath"])
+
+       if not file_path.exists() or not file_path.is_file():
+           raise RuntimeError(f"File does not exist: {args['filepath']}")
+
+       try:
+           content = file_path.read_text(encoding='utf-8')
+           lines = content.split('\n')
+
+           operation = args["operation"]
+           target_type = args["target_type"]
+           target = args["target"]
+           new_content = args["content"]
+
+           if target_type == "heading":
+               # Find the heading
+               target_level = target.count('#')
+               target_text = target.lstrip('#').strip()
+
+               for i, line in enumerate(lines):
+                   if line.startswith('#') and target_text.lower() in line.lower():
+                       if operation == "prepend":
+                           lines.insert(i + 1, new_content)
+                       elif operation == "append":
+                           # Find end of section (next heading of same or higher level)
+                           j = i + 1
+                           while j < len(lines):
+                               if lines[j].startswith('#'):
+                                   heading_level = len(lines[j]) - len(lines[j].lstrip('#'))
+                                   if heading_level <= target_level:
+                                       break
+                               j += 1
+                           lines.insert(j, new_content)
+                       elif operation == "replace":
+                           lines[i] = new_content
+                       break
+
+           elif target_type == "frontmatter":
+               # Handle frontmatter modification
+               if lines[0] == '---':
+                   end_idx = 1
+                   while end_idx < len(lines) and lines[end_idx] != '---':
+                       end_idx += 1
+
+                   if operation == "append" or operation == "prepend":
+                       lines.insert(end_idx, f"{target}: {new_content}")
+                   elif operation == "replace":
+                       for i in range(1, end_idx):
+                           if lines[i].startswith(f"{target}:"):
+                               lines[i] = f"{target}: {new_content}"
+                               break
+
+           file_path.write_text('\n'.join(lines), encoding='utf-8')
+
+       except Exception as e:
+           raise RuntimeError(f"Error patching file: {str(e)}")
 
        return [
            TextContent(
@@ -289,7 +432,7 @@ class PatchContentToolHandler(ToolHandler):
                text=f"Successfully patched content in {args['filepath']}"
            )
        ]
-       
+
 class PutContentToolHandler(ToolHandler):
    def __init__(self):
        super().__init__("obsidian_put_content")
@@ -319,8 +462,15 @@ class PutContentToolHandler(ToolHandler):
        if "filepath" not in args or "content" not in args:
            raise RuntimeError("filepath and content arguments required")
 
-       api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-       api.put_content(args.get("filepath", ""), args["content"])
+       file_path = get_vault_path(args["filepath"])
+
+       # Create parent directories if they don't exist
+       file_path.parent.mkdir(parents=True, exist_ok=True)
+
+       try:
+           file_path.write_text(args["content"], encoding='utf-8')
+       except Exception as e:
+           raise RuntimeError(f"Error writing file: {str(e)}")
 
        return [
            TextContent(
@@ -328,7 +478,7 @@ class PutContentToolHandler(ToolHandler):
                text=f"Successfully uploaded content to {args['filepath']}"
            )
        ]
-   
+
 
 class DeleteFileToolHandler(ToolHandler):
    def __init__(self):
@@ -359,12 +509,22 @@ class DeleteFileToolHandler(ToolHandler):
    def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
        if "filepath" not in args:
            raise RuntimeError("filepath argument missing in arguments")
-       
+
        if not args.get("confirm", False):
            raise RuntimeError("confirm must be set to true to delete a file")
 
-       api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-       api.delete_file(args["filepath"])
+       file_path = get_vault_path(args["filepath"])
+
+       if not file_path.exists():
+           raise RuntimeError(f"File does not exist: {args['filepath']}")
+
+       try:
+           if file_path.is_dir():
+               shutil.rmtree(file_path)
+           else:
+               file_path.unlink()
+       except Exception as e:
+           raise RuntimeError(f"Error deleting file: {str(e)}")
 
        return [
            TextContent(
@@ -372,7 +532,7 @@ class DeleteFileToolHandler(ToolHandler):
                text=f"Successfully deleted {args['filepath']}"
            )
        ]
-   
+
 class ComplexSearchToolHandler(ToolHandler):
    def __init__(self):
        super().__init__("obsidian_complex_search")
@@ -380,30 +540,30 @@ class ComplexSearchToolHandler(ToolHandler):
    def get_tool_description(self):
        return Tool(
            name=self.name,
-           description="""Complex search for documents using a JsonLogic query. 
-           Supports standard JsonLogic operators plus 'glob' and 'regexp' for pattern matching. Results must be non-falsy.
+           description="""Complex search for documents using glob and regex patterns.
+           Supports pattern matching for filenames and content.
 
            Use this tool when you want to do a complex search, e.g. for all documents with certain tags etc.
            ALWAYS follow query syntax in examples.
 
            Examples
             1. Match all markdown files
-            {"glob": ["*.md", {"var": "path"}]}
+            {"glob": ["*.md", "path"]}
 
             2. Match all markdown files with 1221 substring inside them
             {
               "and": [
-                { "glob": ["*.md", {"var": "path"}] },
-                { "regexp": [".*1221.*", {"var": "content"}] }
+                { "glob": ["*.md", "path"] },
+                { "regexp": [".*1221.*", "content"] }
               ]
             }
 
             3. Match all markdown files in Work folder containing name Keaton
             {
               "and": [
-                { "glob": ["*.md", {"var": "path"}] },
-                { "regexp": [".*Work.*", {"var": "path"}] },
-                { "regexp": ["Keaton", {"var": "content"}] }
+                { "glob": ["*.md", "path"] },
+                { "regexp": [".*Work.*", "path"] },
+                { "regexp": ["Keaton", "content"] }
               ]
             }
            """,
@@ -412,10 +572,10 @@ class ComplexSearchToolHandler(ToolHandler):
                "properties": {
                    "query": {
                        "type": "object",
-                       "description": "JsonLogic query object. ALWAYS follow query syntax in examples. \
-                            Example 1: {\"glob\": [\"*.md\", {\"var\": \"path\"}]} matches all markdown files \
-                            Example 2: {\"and\": [{\"glob\": [\"*.md\", {\"var\": \"path\"}]}, {\"regexp\": [\".*1221.*\", {\"var\": \"content\"}]}]} matches all markdown files with 1221 substring inside them \
-                            Example 3: {\"and\": [{\"glob\": [\"*.md\", {\"var\": \"path\"}]}, {\"regexp\": [\".*Work.*\", {\"var\": \"path\"}]}, {\"regexp\": [\"Keaton\", {\"var\": \"content\"}]}]} matches all markdown files in Work folder containing name Keaton \
+                       "description": "Query object with glob/regexp operators. \
+                            Example 1: {\"glob\": [\"*.md\", \"path\"]} matches all markdown files \
+                            Example 2: {\"and\": [{\"glob\": [\"*.md\", \"path\"]}, {\"regexp\": [\".*1221.*\", \"content\"]}]} matches all markdown files with 1221 substring inside them \
+                            Example 3: {\"and\": [{\"glob\": [\"*.md\", \"path\"]}, {\"regexp\": [\".*Work.*\", \"path\"]}, {\"regexp\": [\"Keaton\", \"content\"]}]} matches all markdown files in Work folder containing name Keaton \
                         "
                    }
                },
@@ -427,8 +587,25 @@ class ComplexSearchToolHandler(ToolHandler):
        if "query" not in args:
            raise RuntimeError("query argument missing in arguments")
 
-       api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-       results = api.search_json(args.get("query", ""))
+       query = args["query"]
+       results = []
+
+       # Process query and search files
+       for file_path in vault_root.rglob("*"):
+           if not file_path.is_file() or file_path.name.startswith('.'):
+               continue
+
+           relative_path = str(file_path.relative_to(vault_root))
+
+           try:
+               content = file_path.read_text(encoding='utf-8')
+
+               # Simple query evaluation
+               if self._matches_query(query, relative_path, content):
+                   results.append(relative_path)
+
+           except (UnicodeDecodeError, PermissionError):
+               continue
 
        return [
            TextContent(
@@ -436,6 +613,23 @@ class ComplexSearchToolHandler(ToolHandler):
                text=json.dumps(results, indent=2)
            )
        ]
+
+   def _matches_query(self, query: dict, path: str, content: str) -> bool:
+       """Evaluate a query against a file."""
+       if "and" in query:
+           return all(self._matches_query(q, path, content) for q in query["and"])
+       elif "or" in query:
+           return any(self._matches_query(q, path, content) for q in query["or"])
+       elif "glob" in query:
+           pattern, target = query["glob"]
+           value = path if target == "path" else content
+           from fnmatch import fnmatch
+           return fnmatch(value, pattern)
+       elif "regexp" in query:
+           pattern, target = query["regexp"]
+           value = path if target == "path" else content
+           return bool(re.search(pattern, value))
+       return False
 
 class BatchGetFileContentsToolHandler(ToolHandler):
     def __init__(self):
@@ -466,13 +660,20 @@ class BatchGetFileContentsToolHandler(ToolHandler):
         if "filepaths" not in args:
             raise RuntimeError("filepaths argument missing in arguments")
 
-        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-        content = api.get_batch_file_contents(args["filepaths"])
+        result = []
+
+        for filepath in args["filepaths"]:
+            try:
+                file_path = get_vault_path(filepath)
+                content = file_path.read_text(encoding='utf-8')
+                result.append(f"# {filepath}\n\n{content}\n\n---\n\n")
+            except Exception as e:
+                result.append(f"# {filepath}\n\nError reading file: {str(e)}\n\n---\n\n")
 
         return [
             TextContent(
                 type="text",
-                text=content
+                text="".join(result)
             )
         ]
 
@@ -483,7 +684,7 @@ class PeriodicNotesToolHandler(ToolHandler):
     def get_tool_description(self):
         return Tool(
             name=self.name,
-            description="Get current periodic note for the specified period.",
+            description="Get current periodic note for the specified period. Note: This is a simplified implementation that looks for common periodic note patterns.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -508,25 +709,64 @@ class PeriodicNotesToolHandler(ToolHandler):
             raise RuntimeError("period argument missing in arguments")
 
         period = args["period"]
-        valid_periods = ["daily", "weekly", "monthly", "quarterly", "yearly"]
-        if period not in valid_periods:
-            raise RuntimeError(f"Invalid period: {period}. Must be one of: {', '.join(valid_periods)}")
-        
-        type = args["type"] if "type" in args else "content"
-        valid_types = ["content", "metadata"]
-        if type not in valid_types:
-            raise RuntimeError(f"Invalid type: {type}. Must be one of: {', '.join(valid_types)}")
+        type_arg = args.get("type", "content")
 
-        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-        content = api.get_periodic_note(period,type)
+        # Generate expected filename based on period
+        now = datetime.now()
+        if period == "daily":
+            filename = now.strftime("%Y-%m-%d.md")
+        elif period == "weekly":
+            filename = now.strftime("%Y-W%W.md")
+        elif period == "monthly":
+            filename = now.strftime("%Y-%m.md")
+        elif period == "quarterly":
+            quarter = (now.month - 1) // 3 + 1
+            filename = f"{now.year}-Q{quarter}.md"
+        elif period == "yearly":
+            filename = now.strftime("%Y.md")
+        else:
+            raise RuntimeError(f"Invalid period: {period}")
 
-        return [
-            TextContent(
-                type="text",
-                text=content
-            )
+        # Search for the file in common periodic notes locations
+        search_paths = [
+            filename,
+            f"Daily/{filename}",
+            f"Periodic/{filename}",
+            f"Journal/{filename}",
+            f"{period.capitalize()}/{filename}"
         ]
-        
+
+        for search_path in search_paths:
+            try:
+                file_path = get_vault_path(search_path)
+                if file_path.exists():
+                    content = file_path.read_text(encoding='utf-8')
+
+                    if type_arg == "metadata":
+                        # Return with metadata
+                        return [
+                            TextContent(
+                                type="text",
+                                text=json.dumps({
+                                    "path": search_path,
+                                    "content": content,
+                                    "mtime": file_path.stat().st_mtime
+                                }, indent=2)
+                            )
+                        ]
+                    else:
+                        # Return just content
+                        return [
+                            TextContent(
+                                type="text",
+                                text=content
+                            )
+                        ]
+            except Exception:
+                continue
+
+        raise RuntimeError(f"Periodic note not found for period: {period}")
+
 class RecentPeriodicNotesToolHandler(ToolHandler):
     def __init__(self):
         super().__init__("obsidian_get_recent_periodic_notes")
@@ -565,20 +805,46 @@ class RecentPeriodicNotesToolHandler(ToolHandler):
             raise RuntimeError("period argument missing in arguments")
 
         period = args["period"]
-        valid_periods = ["daily", "weekly", "monthly", "quarterly", "yearly"]
-        if period not in valid_periods:
-            raise RuntimeError(f"Invalid period: {period}. Must be one of: {', '.join(valid_periods)}")
-
         limit = args.get("limit", 5)
-        if not isinstance(limit, int) or limit < 1:
-            raise RuntimeError(f"Invalid limit: {limit}. Must be a positive integer")
-            
         include_content = args.get("include_content", False)
-        if not isinstance(include_content, bool):
-            raise RuntimeError(f"Invalid include_content: {include_content}. Must be a boolean")
 
-        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-        results = api.get_recent_periodic_notes(period, limit, include_content)
+        # Search for periodic notes based on pattern
+        patterns = {
+            "daily": r"\d{4}-\d{2}-\d{2}\.md",
+            "weekly": r"\d{4}-W\d{2}\.md",
+            "monthly": r"\d{4}-\d{2}\.md",
+            "quarterly": r"\d{4}-Q[1-4]\.md",
+            "yearly": r"\d{4}\.md"
+        }
+
+        pattern = patterns.get(period)
+        if not pattern:
+            raise RuntimeError(f"Invalid period: {period}")
+
+        matching_files = []
+        for file_path in vault_root.rglob("*.md"):
+            if re.match(pattern, file_path.name):
+                matching_files.append(file_path)
+
+        # Sort by modification time, most recent first
+        matching_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        matching_files = matching_files[:limit]
+
+        results = []
+        for file_path in matching_files:
+            relative_path = str(file_path.relative_to(vault_root))
+            result = {
+                "path": relative_path,
+                "mtime": file_path.stat().st_mtime
+            }
+
+            if include_content:
+                try:
+                    result["content"] = file_path.read_text(encoding='utf-8')
+                except Exception:
+                    result["content"] = None
+
+            results.append(result)
 
         return [
             TextContent(
@@ -586,7 +852,7 @@ class RecentPeriodicNotesToolHandler(ToolHandler):
                 text=json.dumps(results, indent=2)
             )
         ]
-        
+
 class RecentChangesToolHandler(ToolHandler):
     def __init__(self):
         super().__init__("obsidian_get_recent_changes")
@@ -617,20 +883,30 @@ class RecentChangesToolHandler(ToolHandler):
 
     def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
         limit = args.get("limit", 10)
-        if not isinstance(limit, int) or limit < 1:
-            raise RuntimeError(f"Invalid limit: {limit}. Must be a positive integer")
-            
         days = args.get("days", 90)
-        if not isinstance(days, int) or days < 1:
-            raise RuntimeError(f"Invalid days: {days}. Must be a positive integer")
 
-        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-        results = api.get_recent_changes(limit, days)
+        cutoff_time = (datetime.now() - timedelta(days=days)).timestamp()
+
+        recent_files = []
+        for file_path in vault_root.rglob("*"):
+            if not file_path.is_file() or file_path.name.startswith('.'):
+                continue
+
+            mtime = file_path.stat().st_mtime
+            if mtime >= cutoff_time:
+                recent_files.append({
+                    "path": str(file_path.relative_to(vault_root)),
+                    "mtime": mtime
+                })
+
+        # Sort by mtime descending
+        recent_files.sort(key=lambda x: x["mtime"], reverse=True)
+        recent_files = recent_files[:limit]
 
         return [
             TextContent(
                 type="text",
-                text=json.dumps(results, indent=2)
+                text=json.dumps(recent_files, indent=2)
             )
         ]
 
@@ -686,48 +962,33 @@ class FuzzySearchToolHandler(ToolHandler):
         score_threshold = args.get("score_threshold", 60)
         search_content = args.get("search_content", False)
 
-        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-
-        # Get all files in the vault
-        all_files = api.list_files_in_vault()
-
-        # Extract file paths
+        # Get all file paths
         file_paths = []
-
-        def extract_paths(items, prefix=""):
-            for item in items:
-                if isinstance(item, dict):
-                    # It's a directory
-                    for key, value in item.items():
-                        new_prefix = f"{prefix}{key}/" if prefix else f"{key}/"
-                        extract_paths(value, new_prefix)
-                elif isinstance(item, str):
-                    # It's a file
-                    file_paths.append(f"{prefix}{item}")
-
-        extract_paths(all_files)
+        for file_path in vault_root.rglob("*"):
+            if file_path.is_file() and not file_path.name.startswith('.'):
+                file_paths.append(str(file_path.relative_to(vault_root)))
 
         # Perform fuzzy matching on filenames
         results = []
 
         if search_content:
             # Search both filename and content (slower)
-            for file_path in file_paths:
+            for file_path_str in file_paths:
                 # Score based on filename
-                filename_score = fuzz.WRatio(query.lower(), file_path.lower())
+                filename_score = fuzz.WRatio(query.lower(), file_path_str.lower())
 
                 # If filename score is high enough, include it
                 if filename_score >= score_threshold:
                     results.append({
-                        'filepath': file_path,
+                        'filepath': file_path_str,
                         'score': filename_score,
                         'match_type': 'filename'
                     })
                 else:
                     # Try content search for files that didn't match by name
                     try:
-                        content_data = api.get_file_contents(file_path)
-                        content = content_data.get('content', '') if isinstance(content_data, dict) else ''
+                        file_path = get_vault_path(file_path_str)
+                        content = file_path.read_text(encoding='utf-8')
 
                         if content:
                             # Use partial ratio for content matching
@@ -735,7 +996,7 @@ class FuzzySearchToolHandler(ToolHandler):
 
                             if content_score >= score_threshold:
                                 results.append({
-                                    'filepath': file_path,
+                                    'filepath': file_path_str,
                                     'score': content_score,
                                     'match_type': 'content'
                                 })
@@ -791,35 +1052,18 @@ class ListBasesToolHandler(ToolHandler):
         )
 
     def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
-        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-
-        # Get all files in the vault
-        all_files = api.list_files_in_vault()
-
-        # Extract file paths and find .base files
+        # Find all .base files
         base_files = []
-
-        def extract_paths(items, prefix=""):
-            for item in items:
-                if isinstance(item, dict):
-                    # It's a directory
-                    for key, value in item.items():
-                        new_prefix = f"{prefix}{key}/" if prefix else f"{key}/"
-                        extract_paths(value, new_prefix)
-                elif isinstance(item, str):
-                    # It's a file - check if it's a .base file
-                    if item.endswith('.base'):
-                        base_files.append(f"{prefix}{item}")
-
-        extract_paths(all_files)
+        for file_path in vault_root.rglob("*.base"):
+            if not file_path.name.startswith('.'):
+                base_files.append(file_path)
 
         # Parse each base file
         bases_info = []
         for base_path in base_files:
             try:
-                # Get the content of the base file
-                content_data = api.get_file_contents(base_path)
-                content = content_data.get('content', '') if isinstance(content_data, dict) else ''
+                content = base_path.read_text(encoding='utf-8')
+                relative_path = str(base_path.relative_to(vault_root))
 
                 if content:
                     # Parse YAML
@@ -850,8 +1094,8 @@ class ListBasesToolHandler(ToolHandler):
                             })
 
                     bases_info.append({
-                        'filepath': base_path,
-                        'name': base_path.split('/')[-1].replace('.base', ''),
+                        'filepath': relative_path,
+                        'name': base_path.stem,
                         'filters': base_config.get('filters', {}),
                         'filter_properties': sorted(list(filter_properties)),
                         'views': views_info,
@@ -861,8 +1105,8 @@ class ListBasesToolHandler(ToolHandler):
             except Exception as e:
                 # If we can't parse a base, include it with error info
                 bases_info.append({
-                    'filepath': base_path,
-                    'name': base_path.split('/')[-1].replace('.base', ''),
+                    'filepath': str(base_path.relative_to(vault_root)),
+                    'name': base_path.stem,
                     'error': f"Failed to parse: {str(e)}"
                 })
 
@@ -923,32 +1167,18 @@ class SearchBasesToolHandler(ToolHandler):
         include_content = args.get("include_content", False)
         limit = args.get("limit", 50)
 
-        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-
         # Find the base file
-        all_files = api.list_files_in_vault()
         base_path = None
-
-        def find_base(items, prefix=""):
-            nonlocal base_path
-            for item in items:
-                if isinstance(item, dict):
-                    for key, value in item.items():
-                        new_prefix = f"{prefix}{key}/" if prefix else f"{key}/"
-                        find_base(value, new_prefix)
-                elif isinstance(item, str):
-                    if item == f"{base_name}.base" or item.endswith(f"/{base_name}.base"):
-                        base_path = f"{prefix}{item}"
-                        return
-
-        find_base(all_files)
+        for file_path in vault_root.rglob(f"{base_name}.base"):
+            if not file_path.name.startswith('.'):
+                base_path = file_path
+                break
 
         if not base_path:
             raise RuntimeError(f"Base '{base_name}' not found in vault")
 
         # Load and parse the base file
-        content_data = api.get_file_contents(base_path)
-        content = content_data.get('content', '') if isinstance(content_data, dict) else ''
+        content = base_path.read_text(encoding='utf-8')
 
         if not content:
             raise RuntimeError(f"Base file '{base_path}' is empty")
@@ -971,37 +1201,24 @@ class SearchBasesToolHandler(ToolHandler):
 
         # Get files from the target folder
         if target_folder:
-            try:
-                folder_files = api.list_files_in_dir(target_folder)
-            except Exception:
-                folder_files = []
+            search_path = get_vault_path(target_folder)
+            if search_path.exists():
+                md_files = list(search_path.rglob("*.md"))
+            else:
+                md_files = []
         else:
             # If no folder filter, search entire vault
-            folder_files = all_files
-
-        # Extract markdown files
-        md_files = []
-
-        def extract_md_files(items, prefix=""):
-            for item in items:
-                if isinstance(item, dict):
-                    for key, value in item.items():
-                        new_prefix = f"{prefix}{key}/" if prefix else f"{key}/"
-                        extract_md_files(value, new_prefix)
-                elif isinstance(item, str):
-                    if item.endswith('.md'):
-                        full_path = f"{target_folder}/{prefix}{item}" if target_folder else f"{prefix}{item}"
-                        md_files.append(full_path)
-
-        extract_md_files(folder_files)
+            md_files = list(vault_root.rglob("*.md"))
 
         # Filter files based on properties
         results = []
         for file_path in md_files[:limit * 2]:  # Get more than needed for filtering
+            if file_path.name.startswith('.'):
+                continue
+
             try:
                 # Get file content to extract properties
-                file_data = api.get_file_contents(file_path)
-                file_content = file_data.get('content', '') if isinstance(file_data, dict) else ''
+                file_content = file_path.read_text(encoding='utf-8')
 
                 # Parse frontmatter properties
                 properties = {}
@@ -1035,7 +1252,7 @@ class SearchBasesToolHandler(ToolHandler):
 
                 if matches:
                     result = {
-                        'filepath': file_path,
+                        'filepath': str(file_path.relative_to(vault_root)),
                         'properties': properties
                     }
 

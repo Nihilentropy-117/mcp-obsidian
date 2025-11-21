@@ -17,15 +17,13 @@ load_dotenv()
 
 from . import tools
 
-# Load environment variables
-
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-obsidian")
 
-api_key = os.getenv("OBSIDIAN_API_KEY")
-if not api_key:
-    raise ValueError(f"OBSIDIAN_API_KEY environment variable required. Working directory: {os.getcwd()}")
+vault_path = os.getenv("VAULT_PATH")
+if not vault_path:
+    raise ValueError(f"VAULT_PATH environment variable required. Working directory: {os.getcwd()}")
 
 app = Server("mcp-obsidian")
 

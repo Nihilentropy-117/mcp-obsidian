@@ -8,38 +8,17 @@ services:
     container_name: mcp-obsidian
     restart: unless-stopped
 
-    # Environment variables for Obsidian REST API connection
+    # Environment variable for vault path
     environment:
-      - OBSIDIAN_API_KEY=${OBSIDIAN_API_KEY}
-      - OBSIDIAN_HOST=${OBSIDIAN_HOST:-host.docker.internal}
-      - OBSIDIAN_PORT=${OBSIDIAN_PORT:-27124}
-      - OBSIDIAN_PROTOCOL=${OBSIDIAN_PROTOCOL:-https}
+      - VAULT_PATH=/vault
 
-    # Optional: Mount vault directory (useful for reference or if running Obsidian in container)
+    # Mount vault directory
     volumes:
-      - ./vault:/vault:ro  # Read-only mount of vault
-
-    # Network configuration
-    # Use host network mode to easily access Obsidian running on host
-    network_mode: host
-
-    # Alternative: Use bridge network and expose ports if needed
-    # networks:
-    #   - mcp-network
-    # ports:
-    #   - "27124:27124"  # If you need to expose Obsidian API
-
-    # For debugging: keep container running
-    # command: tail -f /dev/null
+      - ${VAULT_PATH:-./vault}:/vault:ro  # Read-only mount of vault
 
     # Standard input/output for MCP protocol
     stdin_open: true
     tty: true
 
-# Alternative network configuration (uncomment if not using host network)
-# networks:
-#   mcp-network:
-#     driver: bridge
-#     ipam:
-#       config:
-#         - subnet: 172.20.0.0/16
+    # For debugging: keep container running
+    # command: tail -f /dev/null

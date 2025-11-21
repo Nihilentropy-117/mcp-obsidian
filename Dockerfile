@@ -28,9 +28,7 @@ USER mcp
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
-ENV OBSIDIAN_HOST=host.docker.internal
-ENV OBSIDIAN_PORT=27124
-ENV OBSIDIAN_PROTOCOL=https
+ENV VAULT_PATH=/vault
 
 # Health check (optional - checks if python can import the module)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \

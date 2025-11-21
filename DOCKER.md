@@ -2,26 +2,35 @@
 
 This guide explains how to run the MCP Obsidian server using Docker and Docker Compose.
 
+## Overview
+
+The MCP Obsidian server provides direct filesystem access to your Obsidian vault, enabling fast and efficient operations without requiring Obsidian to be running.
+
 ## Prerequisites
 
 1. **Docker** and **Docker Compose** installed
-2. **Obsidian** with the **Local REST API** plugin installed and configured
-3. An **API key** from the Obsidian Local REST API plugin
+2. An **Obsidian vault** directory accessible from your Docker host
 
 ## Quick Start
 
 ### 1. Configure Environment Variables
 
-Copy the example environment file and fill in your Obsidian API key:
+Copy the example environment file and set your vault path:
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` and set your `OBSIDIAN_API_KEY`:
+Edit `.env` and set your `VAULT_PATH`:
 
 ```env
-OBSIDIAN_API_KEY=your-api-key-here
+VAULT_PATH=./vault
+```
+
+Or use an absolute path:
+
+```env
+VAULT_PATH=/absolute/path/to/your/obsidian/vault
 ```
 
 ### 2. Build and Run
@@ -54,33 +63,21 @@ docker-compose down
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OBSIDIAN_API_KEY` | **Required** | API key from Obsidian Local REST API plugin |
-| `OBSIDIAN_HOST` | `host.docker.internal` | Host where Obsidian is running |
-| `OBSIDIAN_PORT` | `27124` | Port for Obsidian REST API |
-| `OBSIDIAN_PROTOCOL` | `https` | Protocol (http or https) |
+| `VAULT_PATH` | **Required** | Path to your Obsidian vault directory on the host |
 
-### Network Modes
+### Vault Mounting
 
-The docker-compose file uses `network_mode: host` by default, which allows the container to access services running on the host (like Obsidian).
+The vault is mounted read-only (`ro`) by default for safety. The container accesses the vault at `/vault` internally.
 
-**For Docker Desktop (Mac/Windows):**
-- Use `OBSIDIAN_HOST=host.docker.internal`
+**For local development:**
+```env
+VAULT_PATH=./vault
+```
 
-**For Linux:**
-- Keep `network_mode: host` OR
-- Use `OBSIDIAN_HOST=172.17.0.1` (Docker bridge IP)
-
-**For Remote Obsidian:**
-- Set `OBSIDIAN_HOST` to the IP address of the machine running Obsidian
-
-## Vault Mounting
-
-The `./vault` directory is mounted to `/vault` inside the container (read-only). This is optional and can be used if:
-- You want the container to have read access to vault files
-- You're running additional services that need vault access
-- You want to back up or process vault files
-
-**Note:** The MCP server accesses vault files via the Obsidian REST API, not directly from the filesystem.
+**For absolute paths:**
+```env
+VAULT_PATH=/Users/yourname/Documents/ObsidianVault
+```
 
 ## Building the Image
 
@@ -105,24 +102,24 @@ docker push your-registry/mcp-obsidian:latest
 
 ## Troubleshooting
 
-### Container can't connect to Obsidian
+### Container can't access vault
 
-1. **Check Obsidian REST API is running:**
-   - Open Obsidian
-   - Go to Settings → Community Plugins → Local REST API
-   - Ensure it's enabled and running
+1. **Check vault path:**
+   - Ensure `VAULT_PATH` in `.env` points to a valid directory
+   - For relative paths, ensure they're relative to the docker-compose.yml location
 
-2. **Verify the API key:**
-   - Check that `OBSIDIAN_API_KEY` in `.env` matches the key in Obsidian
-
-3. **Network connectivity:**
-   - Test connection from container:
+2. **Check permissions:**
+   - Ensure the vault directory is readable by the Docker user (UID 1000)
+   - On Linux, you may need to adjust permissions:
      ```bash
-     docker-compose exec mcp-obsidian curl -k https://host.docker.internal:27124/
+     chmod -R +r /path/to/vault
      ```
 
-4. **Check host firewall:**
-   - Ensure port 27124 is not blocked by your firewall
+3. **Verify mount:**
+   - Check that the vault is mounted correctly:
+     ```bash
+     docker-compose exec mcp-obsidian ls -la /vault
+     ```
 
 ### Container exits immediately
 
@@ -132,8 +129,9 @@ docker-compose logs mcp-obsidian
 ```
 
 Common issues:
-- Missing `OBSIDIAN_API_KEY`
-- Invalid environment variables
+- Missing or invalid `VAULT_PATH`
+- Vault directory doesn't exist
+- Permission denied accessing vault
 - Python dependency issues
 
 ### Debugging
@@ -144,7 +142,25 @@ Run container in interactive mode:
 docker-compose run --rm mcp-obsidian /bin/bash
 ```
 
+Inside the container, check vault access:
+```bash
+ls -la /vault
+cat /vault/some-note.md
+```
+
 ## Advanced Usage
+
+### Read-Write Access
+
+If you need write access to the vault (for creating/editing files), remove the `:ro` flag:
+
+Edit `docker-compose.yml`:
+```yaml
+volumes:
+  - ${VAULT_PATH:-./vault}:/vault  # Remove :ro for read-write
+```
+
+**Warning:** Write access allows the container to modify your vault. Use with caution.
 
 ### Custom Command
 
@@ -172,22 +188,31 @@ services:
           memory: 256M
 ```
 
-### Using Bridge Network
+### Multiple Vaults
 
-If you need custom networking:
+To work with multiple vaults, create multiple service instances:
 
 ```yaml
 services:
-  mcp-obsidian:
-    # Remove: network_mode: host
-    networks:
-      - mcp-network
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+  mcp-obsidian-personal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mcp-obsidian-personal
+    environment:
+      - VAULT_PATH=/vault
+    volumes:
+      - /path/to/personal/vault:/vault:ro
 
-networks:
-  mcp-network:
-    driver: bridge
+  mcp-obsidian-work:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mcp-obsidian-work
+    environment:
+      - VAULT_PATH=/vault
+    volumes:
+      - /path/to/work/vault:/vault:ro
 ```
 
 ## Health Checks
@@ -210,10 +235,64 @@ For production:
 4. Use specific version tags instead of `latest`
 5. Set up monitoring and alerting
 6. Consider using orchestration (Kubernetes, Docker Swarm)
+7. Enable read-only filesystem where possible
+8. Run regular backups of your vault
 
 ## Security Notes
 
-- The `.env` file contains sensitive API keys - never commit it to version control
-- The vault is mounted read-only for security
-- SSL verification for Obsidian API is handled by the plugin
+- The vault is mounted read-only by default for security
 - Container runs as non-root user (UID 1000)
+- No network exposure required (MCP uses stdio)
+- Path traversal protection built into the server
+- Consider running in a restricted Docker network
+
+## Performance Tips
+
+1. **Use SSD storage** for the vault for better I/O performance
+2. **Limit vault size** - large vaults (>10GB) may have slower search times
+3. **Exclude large binary files** from vault directory if possible
+4. **Use fuzzy search sparingly** on large vaults with `search_content=true`
+
+## Differences from REST API Version
+
+This version uses **direct filesystem access** instead of the Obsidian REST API plugin:
+
+**Advantages:**
+- ✅ **Much faster** - no HTTP overhead
+- ✅ **No Obsidian required** - works without Obsidian running
+- ✅ **Simpler setup** - just point to vault directory
+- ✅ **Better for Docker** - clean containerization
+
+**Limitations:**
+- ❌ **No real-time sync** - doesn't see changes made while running
+- ❌ **No plugin integration** - can't use Dataview/Templater features
+- ❌ **Basic periodic notes** - simplified implementation
+
+## Migration from REST API Version
+
+If migrating from the REST API version:
+
+1. Remove old environment variables:
+   - `OBSIDIAN_API_KEY`
+   - `OBSIDIAN_HOST`
+   - `OBSIDIAN_PORT`
+   - `OBSIDIAN_PROTOCOL`
+
+2. Add new environment variable:
+   - `VAULT_PATH=/path/to/vault`
+
+3. Rebuild the container:
+   ```bash
+   docker-compose down
+   docker-compose build --no-cache
+   docker-compose up -d
+   ```
+
+## Backup Recommendations
+
+Since the server has read-only access by default, your vault is safe from accidental modifications. However, always maintain backups:
+
+1. Use git for version control
+2. Set up automated backups
+3. Use cloud sync (Dropbox, iCloud, etc.)
+4. Test your backups regularly
